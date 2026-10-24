@@ -14,13 +14,42 @@ const zlib = require("zlib");
 const { Readable, pipeline } = require("stream");
 const { promisify } = require("util");
 
+// ---------- Full browser engine (Scramjet) ----------
+// Scramjet runs inside the visitor's browser as a service worker, so sites like TikTok, YouTube and
+// Instagram believe they're on their real domain. Its network traffic goes through the "wisp"
+// WebSocket endpoint below. If the packages aren't installed (npm install), the site still works
+// with the simpler built-in "lite" proxy at /p/.
+let ENGINE = null;
+// Cross-origin isolation (ISOLATE=1) adds support for rare synchronous requests, but makes sites stricter.
+const ISOLATE = process.env.ISOLATE === "1";
+try {
+  ENGINE = {
+    scramjetDir: require("@mercuryworkshop/scramjet/path").scramjetPath,
+    baremuxDir: require("@mercuryworkshop/bare-mux/node").baremuxPath,
+    libcurlDir: require("@mercuryworkshop/libcurl-transport").libcurlPath,
+    wisp: require("@mercuryworkshop/wisp-js/server"),
+  };
+  ENGINE.wisp.logging.set_level(ENGINE.wisp.logging.ERROR); // warnings are too noisy for Render logs
+  Object.assign(ENGINE.wisp.server.options, {
+    allow_udp_streams: false, // websites only need TCP
+    allow_private_ips: false, // never let visitors reach Render's internal network
+    allow_loopback_ips: false,
+    // Web ports plus the high ports game servers use. Blocks mail (25/465/587), SSH and other
+    // low system ports, so nobody can use this server to send spam or attack other machines.
+    port_whitelist: [80, 443, [1024, 65535]],
+  });
+} catch (err) {
+  ENGINE = null;
+  console.warn("Scramjet engine not installed, using the lite proxy only. Run `npm install` to enable it.");
+}
+
 const brotliAsync = promisify(zlib.brotliCompress);
 const gzipAsync = promisify(zlib.gzip);
 
 const PORT = process.env.PORT || 3000;
 const PREFIX = "/p/";
 const CLIENT_SCRIPT_PATH = "/__proxy.js";
-const CLIENT_SCRIPT_URL = CLIENT_SCRIPT_PATH + "?v=3";
+const CLIENT_SCRIPT_URL = CLIENT_SCRIPT_PATH + "?v=4";
 
 const UPSTREAM_TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 20000;
 const MAX_REQUEST_BODY = 10 * 1024 * 1024; // 10 MB uploads
@@ -217,12 +246,13 @@ function proxify(url, base) {
   }
 }
 
-function normalizeTarget(input) {
+function normalizeTarget(input, fullEngine = false) {
   let s = input.trim();
   if (!/^https?:\/\//i.test(s)) {
     // Looks like a domain? Otherwise treat it as a search.
+    // The full engine can run DuckDuckGo's normal site; the lite proxy needs its plain HTML version.
     if (/^[^\s]+\.[^\s]+$/.test(s)) s = "https://" + s;
-    else s = "https://duckduckgo.com/html/?q=" + encodeURIComponent(s);
+    else s = (fullEngine ? "https://duckduckgo.com/?q=" : "https://duckduckgo.com/html/?q=") + encodeURIComponent(s);
   }
   return new URL(s).href;
 }
@@ -491,7 +521,7 @@ const CLIENT_JS = `(function(){
     ["keydown","keyup","keypress"].forEach(function(t){input.addEventListener(t,function(e){e.stopPropagation();});});
     input.addEventListener("focus",function(){input.select();});
     root.querySelector("form").addEventListener("submit",function(e){
-      e.preventDefault();var v=input.value.trim();if(v)location.href="/go?url="+encodeURIComponent(v);
+      e.preventDefault();var v=input.value.trim();if(v)location.href="/go?lite=1&url="+encodeURIComponent(v);
     });
     bar.addEventListener("click",function(e){
       var b=e.target.closest("[data-a]");if(!b)return;
@@ -577,8 +607,7 @@ const SITE_CSS = `${THEME_VARS}
   .center{min-height:calc(100vh - 140px);display:flex;align-items:center;justify-content:center}
   .box{width:min(680px,100%);text-align:center}
   h1{font-weight:700;margin:0 0 24px;letter-spacing:-.5px}
-  .hero h1{font-size:clamp(34px,6vw,52px);margin-bottom:8px}
-  .tagline{color:var(--muted);margin:0 0 28px;letter-spacing:3px;text-transform:uppercase;font-size:12px}
+  .hero h1{font-size:clamp(34px,6vw,52px);margin-bottom:28px}
 
   form{display:flex;gap:8px;position:relative}
   input{flex:1;min-width:0;padding:14px 16px;border-radius:10px;border:1px solid var(--line);background:var(--panel);
@@ -621,7 +650,8 @@ const SITE_CSS = `${THEME_VARS}
   .tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-top:26px}
   .tile{display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 6px;border-radius:12px;background:rgba(20,23,29,.8);
         border:1px solid var(--line);text-decoration:none;font-size:13px;color:var(--muted);transition:border-color .15s,color .15s,transform .15s}
-  .tile i{font-style:normal;width:38px;height:38px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:17px;
+  .tile span{line-height:1.25}
+  .tile i{font-style:normal;width:38px;height:38px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:14px;
           border:1px solid rgba(var(--gold-rgb),.45);color:var(--gold-light);background:var(--panel-2)}
   .tile:hover{border-color:var(--gold);color:var(--text);transform:translateY(-2px)}
   @media (max-width:640px){.tiles{grid-template-columns:repeat(3,1fr)}}
@@ -738,17 +768,24 @@ ${SITE_JS}${script}
 }
 
 // Shortcut tiles under the search bar. Edit this list to change them.
+// "icon" is the short label shown in the gold circle. Big game portals (Poki, CrazyGames, Coolmath)
+// lock their games to their own domain, so they're left out: their games won't start through a proxy.
 const QUICK_LINKS = [
-  { name: "Wikipedia", url: "https://en.wikipedia.org" },
-  { name: "DuckDuckGo", url: "https://duckduckgo.com/html/" },
-  { name: "Reddit", url: "https://old.reddit.com" },
-  { name: "GitHub", url: "https://github.com" },
-  { name: "Hacker News", url: "https://news.ycombinator.com" },
-  { name: "Archive", url: "https://archive.org" },
+  { name: "TikTok", icon: "Tk", url: "https://www.tiktok.com" },
+  { name: "YouTube", icon: "Yt", url: "https://www.youtube.com" },
+  { name: "Instagram", icon: "Ig", url: "https://www.instagram.com" },
+  { name: "Reddit", icon: "Rd", url: "https://www.reddit.com" },
+  { name: "X", icon: "X", url: "https://x.com" },
+  { name: "Discord", icon: "Dc", url: "https://discord.com/app" },
+  { name: "Twitch", icon: "Tw", url: "https://www.twitch.tv" },
+  { name: "Spotify", icon: "Sp", url: "https://open.spotify.com" },
+  { name: "Agar.io", icon: "Ag", url: "https://agar.io" },
+  { name: "Lichess", icon: "Li", url: "https://lichess.org" },
+  { name: "itch.io", icon: "It", url: "https://itch.io/games/html5" },
+  { name: "Chess.com", icon: "Ch", url: "https://www.chess.com" },
 ];
 
 const HOME_JS = `<script>(function(){
-  var P=${JSON.stringify(PREFIX)};
   var form=document.querySelector("form.plugged");
   form.addEventListener("submit",function(){form.classList.add("sending");});
 
@@ -762,7 +799,7 @@ const HOME_JS = `<script>(function(){
     var label=document.createElement("span");label.className="label";label.textContent="Recent";box.appendChild(label);
     list.forEach(function(item,i){
       var chip=document.createElement("span");chip.className="chip";
-      var a=document.createElement("a");a.href=P+item.url;a.textContent=item.host;a.title=item.url;
+      var a=document.createElement("a");a.href="/go?url="+encodeURIComponent(item.url);a.textContent=item.host;a.title=item.url;
       var x=document.createElement("button");x.type="button";x.textContent="\\u00d7";x.setAttribute("aria-label","Remove "+item.host);
       x.addEventListener("click",function(){list.splice(i,1);save();render();});
       chip.appendChild(a);chip.appendChild(x);box.appendChild(chip);
@@ -779,7 +816,6 @@ const HOME_PAGE = renderPage(
   "proxy",
   `<main class="center"><div class="box hero">
   <h1>Quick<span class="gold">Wire</span> Proxy</h1>
-  <p class="tagline">Browse through the wire</p>
   <form class="plugged" action="/go" method="get">
     <span class="spark l"></span><span class="spark r"></span>
     <input name="url" placeholder="Enter a URL or search term" autofocus required>
@@ -787,7 +823,7 @@ const HOME_PAGE = renderPage(
   </form>
   <p class="hint">Example: example.com or https://en.wikipedia.org</p>
   <div class="tiles">${QUICK_LINKS.map(
-    (l) => `<a class="tile" href="${escapeHtml(PREFIX + l.url)}"><i>${escapeHtml(l.name[0])}</i><span>${escapeHtml(l.name)}</span></a>`
+    (l) => `<a class="tile" href="/go?url=${encodeURIComponent(l.url)}"><i>${escapeHtml(l.icon || l.name[0])}</i><span>${escapeHtml(l.name)}</span></a>`
   ).join("")}</div>
   <div class="recent" id="recent" hidden></div>
 </div></main>`,
@@ -1012,16 +1048,218 @@ try{var id=${jsString(game.id)},l=JSON.parse(localStorage.getItem("qw-played")||
 </body></html>`);
 }
 
+// ---------- Full browser (Scramjet) ----------
+
+const SCRAMJET_PREFIX = "/scramjet/";
+
+// Service worker. It covers the whole site so it can talk to the browser page, but it only steps in
+// for /scramjet/ addresses. Every other request (games, lite proxy, the site itself) goes untouched.
+const SW_JS = Buffer.from(`importScripts("/scram/scramjet.all.js");
+const { ScramjetServiceWorker } = $scramjetLoadWorker();
+const scramjet = new ScramjetServiceWorker();
+// Scramjet 1.1.0 stores a config sent by message without activating it, which breaks returning
+// visitors. Clearing it makes the worker load and activate the saved config on the next request.
+self.addEventListener("message", (event) => {
+  if (event.data && event.data.scramjet$type === "loadConfig") scramjet.config = undefined;
+});
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+const PREFIX = ${JSON.stringify(SCRAMJET_PREFIX)};
+self.addEventListener("fetch", (event) => {
+  // Same rule as Scramjet's own router: proxied pages, plus its .wasm file (which the worker
+  // converts into a script for background workers).
+  const p = new URL(event.request.url).pathname;
+  if (!p.startsWith(PREFIX) && p !== "/scram/scramjet.wasm.wasm") return;
+  event.respondWith((async () => {
+    await scramjet.loadConfig();
+    if (scramjet.route(event)) return scramjet.fetch(event);
+    return fetch(event.request);
+  })());
+});
+`);
+
+const BROWSE_CSS = `
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:system-ui,sans-serif}
+  body{display:flex;flex-direction:column}
+  header{position:relative;display:flex;align-items:center;gap:6px;padding:7px 10px;background:var(--bg);z-index:2}
+  header::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;opacity:.6;
+                background:linear-gradient(90deg,transparent,var(--gold) 20%,var(--gold) 80%,transparent)}
+  .b{flex:none;width:34px;height:34px;display:grid;place-items:center;border-radius:50%;border:1px solid var(--line);background:var(--panel-2);
+     color:var(--text);cursor:pointer;padding:0;text-decoration:none;transition:border-color .15s,color .15s}
+  .b:hover,.b:focus-visible{border-color:var(--gold);color:var(--gold-light);outline:none}
+  .b svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+  .b.logo{border-color:rgba(var(--gold-rgb),.6)}
+  .b.logo svg{width:20px;height:20px;stroke:none}
+  .pill{flex:none;height:34px;padding:0 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel-2);color:var(--muted);
+        font:inherit;font-size:12px;cursor:pointer;transition:border-color .15s,color .15s}
+  .pill:hover{border-color:var(--gold);color:var(--gold-light)}
+  form{flex:1;min-width:0;display:flex;margin:0}
+  input{flex:1;min-width:0;height:34px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:inherit;font-size:14px;outline:none}
+  input:focus{border-color:var(--gold);box-shadow:var(--glow)}
+  .loadbar{position:absolute;left:0;bottom:-2px;height:3px;width:0;background:var(--gold-grad);box-shadow:0 0 10px var(--gold);opacity:0;transition:opacity .25s;pointer-events:none}
+  .loadbar.on{opacity:1;animation:load 8s cubic-bezier(.1,.7,.2,1) forwards}
+  @keyframes load{0%{width:0}10%{width:35%}100%{width:92%}}
+  main{position:relative;flex:1;display:flex}
+  iframe{flex:1;width:100%;border:0;background:#fff}
+  .status{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:var(--bg);
+          text-align:center;padding:24px;color:var(--muted)}
+  .status[hidden]{display:none}
+  .status strong{color:var(--text);font-size:18px}
+  .spin{width:38px;height:38px;border-radius:50%;border:3px solid rgba(var(--gold-rgb),.2);border-top-color:var(--gold);animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .status a{color:var(--gold-light)}
+  @media (max-width:560px){.sm-hide{display:none}}
+  @media (prefers-reduced-motion:reduce){.loadbar.on{animation:none;width:60%}.spin{animation-duration:2s}}
+`;
+
+const ICON = {
+  back: `<svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>`,
+  fwd: `<svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>`,
+  reload: `<svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></svg>`,
+  full: `<svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>`,
+};
+
+const BROWSE_JS = `<script>(async function(){
+  var params=new URLSearchParams(location.search),target=params.get("url")||"";
+  var frameEl=document.getElementById("view"),input=document.getElementById("addr"),load=document.getElementById("load");
+  var status=document.getElementById("status"),statusText=document.getElementById("status-text");
+  var current=target;
+  if(!/^https?:\\/\\//i.test(target)){location.replace("/");return;}
+  input.value=target;
+
+  function startLoad(){load.classList.remove("on");void load.offsetWidth;load.classList.add("on");}
+  function stopLoad(){load.classList.remove("on");}
+  function lite(u){location.href="/p/"+(u||current);}
+  function remember(u){
+    try{var h=new URL(u);if(!/^https?:$/.test(h.protocol))return;
+      var l=JSON.parse(localStorage.getItem("qw-recent")||"[]").filter(function(r){return r&&r.host!==h.hostname;});
+      l.unshift({host:h.hostname,url:h.href});localStorage.setItem("qw-recent",JSON.stringify(l.slice(0,8)));}catch(e){}
+  }
+  function toUrl(v){
+    v=v.trim();if(!v)return "";
+    if(/^https?:\\/\\//i.test(v))return v;
+    if(/^[^\\s]+\\.[^\\s]+$/.test(v))return "https://"+v;
+    return "https://duckduckgo.com/?q="+encodeURIComponent(v);
+  }
+  function fail(msg){
+    stopLoad();status.hidden=false;
+    status.innerHTML="";
+    var s=document.createElement("strong");s.textContent="The full browser couldn't start";
+    var p=document.createElement("p");p.textContent=msg;
+    var a=document.createElement("a");a.href="/p/"+current;a.textContent="Open this page in lite mode instead";
+    status.appendChild(s);status.appendChild(p);status.appendChild(a);
+  }
+  // Wait until the newest worker is in charge. After a site update the old worker keeps running
+  // until the new one activates, so wait for the new one rather than using the old one.
+  function activated(reg){
+    return new Promise(function(resolve){
+      var w=reg.installing||reg.waiting;
+      if(!w||w.state==="activated")return resolve();
+      w.addEventListener("statechange",function(){if(w.state==="activated"||w.state==="redundant")resolve();});
+    });
+  }
+
+  var frame;
+  try{
+    if(!("serviceWorker" in navigator))throw new Error("This browser doesn't allow service workers here (private windows sometimes block them).");
+    statusText.textContent="Connecting the wire\\u2026";
+    var Controller=$scramjetLoadController().ScramjetController;
+    var scramjet=new Controller({prefix:${JSON.stringify(SCRAMJET_PREFIX)},files:{wasm:"/scram/scramjet.wasm.wasm",all:"/scram/scramjet.all.js",sync:"/scram/scramjet.sync.js"}});
+    await scramjet.init();
+    var reg=await navigator.serviceWorker.register("/sw.js",{scope:"/"});
+    try{await reg.update();}catch(e){}
+    await activated(reg);
+    var conn=new BareMux.BareMuxConnection("/baremux/worker.js");
+    var wisp=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/wisp/";
+    // Always set it: a returning visitor gets a fresh shared worker that has no transport yet.
+    await conn.setTransport("/libcurl/index.mjs",[{wisp:wisp}]);
+    frame=scramjet.createFrame(frameEl);
+  }catch(err){fail(String(err&&err.message||err));return;}
+
+  frame.addEventListener("urlchange",function(e){
+    var u=String(e.url);current=u;status.hidden=true;
+    if(document.activeElement!==input)input.value=u;
+    history.replaceState(null,"","/browse?url="+encodeURIComponent(u));
+    remember(u);
+  });
+  frame.addEventListener("navigate",startLoad);
+  var retried={};
+  frameEl.addEventListener("load",function(){
+    // A one-off network hiccup shows Scramjet's error page. Retry that address once automatically.
+    try{
+      var d=frameEl.contentDocument;
+      if(d&&d.title==="Scramjet"&&d.body&&/error loading/i.test(d.body.innerText)&&!retried[current]){
+        retried[current]=true;startLoad();frame.reload();return;
+      }
+    }catch(e){}
+    stopLoad();status.hidden=true;
+    try{var t=frameEl.contentDocument&&frameEl.contentDocument.title;document.title=(t?t+" \\u00b7 ":"")+"QuickWire";}catch(e){}
+  });
+
+  document.getElementById("bar").addEventListener("click",function(e){
+    var b=e.target.closest("[data-a]");if(!b)return;
+    var a=b.getAttribute("data-a");
+    if(a==="back")frame.back();
+    else if(a==="fwd")frame.forward();
+    else if(a==="reload"){startLoad();frame.reload();}
+    else if(a==="lite")lite();
+    else if(a==="full"){(frameEl.requestFullscreen||frameEl.webkitRequestFullscreen).call(frameEl);}
+  });
+  document.getElementById("addr-form").addEventListener("submit",function(e){
+    e.preventDefault();var u=toUrl(input.value);if(!u)return;
+    current=u;startLoad();frame.go(u);input.blur();
+  });
+  input.addEventListener("focus",function(){input.select();});
+
+  startLoad();remember(target);frame.go(target);
+  // Some sites never fire "load" (they keep streaming), so don't leave the overlay up forever.
+  setTimeout(function(){status.hidden=true;},10000);
+})();</script>`;
+
+function renderBrowsePage() {
+  return Buffer.from(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>QuickWire</title>
+<meta name="theme-color" content="#0c0e12">${FAVICON}${ACCENT_BOOT}
+<style>${THEME_VARS}${BROWSE_CSS}</style>
+<script src="/scram/scramjet.all.js"></script>
+<script src="/baremux/index.js"></script>
+</head>
+<body>
+<header id="bar">
+  <a class="b logo" href="/" title="QuickWire home" aria-label="Home">${LOGO_SVG}</a>
+  <button class="b" data-a="back" title="Back" aria-label="Back">${ICON.back}</button>
+  <button class="b sm-hide" data-a="fwd" title="Forward" aria-label="Forward">${ICON.fwd}</button>
+  <button class="b" data-a="reload" title="Reload" aria-label="Reload">${ICON.reload}</button>
+  <form id="addr-form"><input id="addr" spellcheck="false" autocomplete="off" aria-label="Address"></form>
+  <button class="pill sm-hide" data-a="lite" title="Open this page with the simpler lite proxy">Lite mode</button>
+  <button class="b sm-hide" data-a="full" title="Fullscreen" aria-label="Fullscreen">${ICON.full}</button>
+  <div class="loadbar" id="load"></div>
+</header>
+<main>
+  <iframe id="view" title="Browsing" allow="fullscreen; autoplay; clipboard-read; clipboard-write; encrypted-media; picture-in-picture" allowfullscreen></iframe>
+  <div class="status" id="status"><div class="spin"></div><span id="status-text">Loading…</span></div>
+</main>
+${BROWSE_JS}
+</body></html>`);
+}
+
 // Serve a file from the games folder (never anything outside it).
-async function serveGameFile(req, res, url) {
+function serveGameFile(req, res, url) {
+  return serveStatic(req, res, url, "/games/", GAMES_DIR, "no-cache"); // always check for edits; unchanged files get a quick 304
+}
+
+// Serve a file from rootDir for URLs starting with mount. Paths can never escape rootDir.
+async function serveStatic(req, res, url, mount, rootDir, cacheControl) {
   let rel;
   try {
-    rel = decodeURIComponent(url.pathname.slice("/games/".length));
+    rel = decodeURIComponent(url.pathname.slice(mount.length));
   } catch {
     return sendError(res, 400, "Bad file name.");
   }
-  let file = path.resolve(GAMES_DIR, rel);
-  if (!file.startsWith(GAMES_DIR + path.sep)) return sendError(res, 403, "Not allowed.");
+  let file = path.resolve(rootDir, rel);
+  if (!file.startsWith(rootDir + path.sep)) return sendError(res, 403, "Not allowed.");
 
   let stat;
   try {
@@ -1033,7 +1271,7 @@ async function serveGameFile(req, res, url) {
       stat = await fs.promises.stat(file);
     }
   } catch {
-    return sendError(res, 404, "Game file not found.");
+    return sendError(res, 404, "File not found.");
   }
 
   // Answer "not modified" when the browser already has this version.
@@ -1053,7 +1291,7 @@ async function serveGameFile(req, res, url) {
   const type = MIME[ext] || "application/octet-stream";
   const headers = {
     "content-type": type,
-    "cache-control": "no-cache", // always check for edits; unchanged files get a quick 304
+    "cache-control": cacheControl,
     "last-modified": stat.mtime.toUTCString(),
   };
 
@@ -1292,6 +1530,51 @@ const server = http.createServer(async (req, res) => {
       return sendBody(req, res, 200, { "content-type": "text/html; charset=utf-8" }, HOME_PAGE, "text/html", null);
     }
 
+    // Full browser engine files and pages.
+    if (url.pathname === "/browse" || url.pathname.startsWith("/scram/") || url.pathname.startsWith("/baremux/") ||
+        url.pathname.startsWith("/libcurl/") || url.pathname === "/sw.js" || url.pathname.startsWith(SCRAMJET_PREFIX)) {
+      if (!ENGINE) {
+        // Engine not installed: send browse links to the lite proxy instead.
+        const target = url.searchParams.get("url");
+        return target ? redirect(res, PREFIX + target) : sendError(res, 404, "The full browser isn't installed on this server.");
+      }
+      // Everything the full browser loads must carry matching isolation headers, otherwise the
+      // isolated /browse page can't use bare-mux's shared worker.
+      if (ISOLATE) {
+        res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+        res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+        res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+      }
+      const ENGINE_CACHE = "public, max-age=86400";
+      if (url.pathname.startsWith("/scram/")) return await serveStatic(req, res, url, "/scram/", ENGINE.scramjetDir, ENGINE_CACHE);
+      if (url.pathname.startsWith("/baremux/")) return await serveStatic(req, res, url, "/baremux/", ENGINE.baremuxDir, ENGINE_CACHE);
+      if (url.pathname.startsWith("/libcurl/")) return await serveStatic(req, res, url, "/libcurl/", ENGINE.libcurlDir, ENGINE_CACHE);
+      if (url.pathname === "/sw.js") {
+        return sendBody(req, res, 200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" }, SW_JS, "text/javascript", null);
+      }
+      if (url.pathname === "/browse") {
+        return sendBody(
+          req,
+          res,
+          200,
+          {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-cache",
+          },
+          renderBrowsePage(),
+          "text/html",
+          null
+        );
+      }
+      // A /scramjet/ page reached the server directly (opened in a new tab, or before the
+      // service worker was ready). Send it back through the browser page.
+      try {
+        const real = decodeURIComponent(url.pathname.slice(SCRAMJET_PREFIX.length)) + url.search;
+        if (/^https?:\/\//i.test(real)) return redirect(res, "/browse?url=" + encodeURIComponent(real));
+      } catch {}
+      return sendError(res, 404, "Not found. Go to the home page to enter a URL.");
+    }
+
     if (url.pathname === "/games" || url.pathname === "/games/") {
       const page = await renderGamesPage();
       return sendBody(req, res, 200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" }, page, "text/html", null);
@@ -1329,7 +1612,10 @@ const server = http.createServer(async (req, res) => {
       const q = url.searchParams.get("url") || "";
       if (!q) return redirect(res, "/");
       try {
-        return redirect(res, PREFIX + normalizeTarget(q));
+        // Full browser by default; "lite=1" (or a server without the engine) uses the simple proxy.
+        const full = ENGINE && url.searchParams.get("lite") !== "1";
+        const target = normalizeTarget(q, full);
+        return redirect(res, full ? "/browse?url=" + encodeURIComponent(target) : PREFIX + target);
       } catch {
         return sendError(res, 400, "Invalid URL.");
       }
@@ -1361,9 +1647,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// WebSocket connections: the full browser's network traffic arrives at /wisp/.
+server.on("upgrade", (req, socket, head) => {
+  if (ENGINE && req.url.startsWith("/wisp/")) return ENGINE.wisp.server.routeRequest(req, socket, head);
+  socket.destroy();
+});
+
 // Keep the server alive if a single request misbehaves.
 process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Proxy running on http://localhost:${PORT} (cache ${CACHE_MAX_BYTES / 1048576} MB)`);
+  console.log(
+    `Proxy running on http://localhost:${PORT} (cache ${CACHE_MAX_BYTES / 1048576} MB, ` +
+      `${ENGINE ? "full browser engine on" : "lite proxy only"})`
+  );
 });

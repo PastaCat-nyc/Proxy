@@ -1,12 +1,18 @@
 {
   "name": "web-proxy",
   "version": "1.0.0",
-  "description": "Simple zero-dependency web proxy",
+  "description": "QuickWire web proxy with a Scramjet browser engine and a games library",
   "main": "main.js",
   "scripts": {
     "start": "node main.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@mercuryworkshop/bare-mux": "2.1.9",
+    "@mercuryworkshop/libcurl-transport": "1.5.2",
+    "@mercuryworkshop/scramjet": "1.1.0",
+    "@mercuryworkshop/wisp-js": "0.5.1"
   }
 }
