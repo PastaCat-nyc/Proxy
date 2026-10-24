@@ -1,0 +1,23 @@
+<html>
+<head>
+<meta charset="utf-8" />
+<link rel="stylesheet" href="p4wn.css" />
+</head>
+<body>
+
+<!-- Put anything you like here... -->
+
+<div id="board-goes-here"></div>
+
+<!-- ...and here -->
+
+<script src="engine.js"></script>
+<script src="display.js"></script>
+<script>
+var game = p4wnify("board-goes-here");
+game.next_move();
+</script>
+<!-- Uncomment if you like to optimize to screen resolution -->
+<!-- script src="resolutionawareness.js"></script -->
+</body>
+</html>
